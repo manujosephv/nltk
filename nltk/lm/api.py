@@ -2,21 +2,48 @@
 #
 # Copyright (C) 2001-2020 NLTK Project
 # Authors: Ilia Kurenkov <ilia.kurenkov@gmail.com>
+#          Manu Joseph <manujosephv@gmail.com>
 # URL: <http://nltk.org/>
 # For license information, see LICENSE.TXT
 """Language Model Interface."""
 
 import random
 from abc import ABCMeta, abstractmethod
-from bisect import bisect
-
-
+from functools import partial
+import sys
 from nltk.lm.counter import NgramCounter
 from nltk.lm.util import log_base2
 from nltk.lm.vocabulary import Vocabulary
 
-from itertools import accumulate
+from collections import defaultdict
+from tqdm.autonotebook import tqdm as progress
+from sys import getsizeof
 
+def _mean(items):
+    """Return average (aka mean) for sequence of items."""
+    return sum(items) / len(items)
+
+
+def _random_generator(seed_or_generator):
+    if isinstance(seed_or_generator, random.Random):
+        return seed_or_generator
+    return random.Random(seed_or_generator)
+
+
+def greedy_decoding(distribution, **kwargs):
+    rnd_gen = kwargs.get("random_generator")
+    weights = [entry[1] for entry in distribution]
+    if sum(weights) > 0:
+        # If there are multiple words with same probability, we choose
+        # one at random
+        top_samples = [
+            sample for sample, weight in distribution if weight == weights[0]
+        ]
+        r = int(rnd_gen.uniform(0, len(top_samples) - 1))
+        return top_samples[r]
+    else:
+        eos = kwargs.get("EOS", "</s>")
+        return eos
 
 class Smoothing(metaclass=ABCMeta):
     """Ngram Smoothing Interface
@@ -49,32 +76,6 @@ class Smoothing(metaclass=ABCMeta):
         raise NotImplementedError()
 
 
-def _mean(items):
-    """Return average (aka mean) for sequence of items."""
-    return sum(items) / len(items)
-
-
-def _random_generator(seed_or_generator):
-    if isinstance(seed_or_generator, random.Random):
-        return seed_or_generator
-    return random.Random(seed_or_generator)
-
-
-def _weighted_choice(population, weights, random_generator=None):
-    """Like random.choice, but with weights.
-
-    Heavily inspired by python 3.6 `random.choices`.
-    """
-    if not population:
-        raise ValueError("Can't choose from empty population")
-    if len(population) != len(weights):
-        raise ValueError("The number of weights does not match the population")
-    cum_weights = list(accumulate(weights))
-    total = cum_weights[-1]
-    threshold = random_generator.random()
-    return population[bisect(cum_weights, total * threshold)]
-
-
 class LanguageModel(metaclass=ABCMeta):
     """ABC for Language Models.
 
@@ -82,7 +83,13 @@ class LanguageModel(metaclass=ABCMeta):
 
     """
 
-    def __init__(self, order, vocabulary=None, counter=None):
+    def __init__(
+        self,
+        order,
+        vocabulary=None,
+        counter=None,
+        verbose=True,
+    ):
         """Creates new LanguageModel.
 
         :param vocabulary: If provided, this vocabulary will be used instead
@@ -100,8 +107,23 @@ class LanguageModel(metaclass=ABCMeta):
         self.order = order
         self.vocab = Vocabulary() if vocabulary is None else vocabulary
         self.counts = NgramCounter() if counter is None else counter
+        def_dict_callable = partial(defaultdict, float)
+        self._cache = defaultdict(def_dict_callable)
+        self.verbose = verbose
 
-    def fit(self, text, vocabulary_text=None):
+    def _update_cache(self, word):
+        i, word = word
+        ret_list = []
+        for order in range(2, self.order + 1):
+            for context in self.counts[order].keys():
+                if self.counts[order][context].N() > self.cache_limit:
+                    ret_list.append((context, word, self.score(word, context)))
+        return ret_list
+
+    def _check_cache_size(self):
+        return getsizeof(self._cache)/1e6
+
+    def fit(self, text, vocabulary_text=None, verbose=True):
         """Trains the model on a text.
 
         :param text: Training text as a sequence of sentences.
@@ -113,7 +135,10 @@ class LanguageModel(metaclass=ABCMeta):
                     "Cannot fit without a vocabulary or text to create it from."
                 )
             self.vocab.update(vocabulary_text)
-        self.counts.update(self.vocab.lookup(sent) for sent in text)
+        _iter = (self.vocab.lookup(sent) for sent in text)
+        self.counts.update(
+            progress(_iter, desc="Fitting the model") if self.verbose else _iter
+        )
 
     def score(self, word, context=None):
         """Masks out of vocab (OOV) words and computes their model score.
@@ -161,6 +186,7 @@ class LanguageModel(metaclass=ABCMeta):
             self.counts[len(context) + 1][context] if context else self.counts.unigrams
         )
 
+
     def entropy(self, text_ngrams):
         """Calculate cross-entropy of model for given evaluation text.
 
@@ -178,59 +204,69 @@ class LanguageModel(metaclass=ABCMeta):
         This is simply 2 ** cross-entropy for the text, so the arguments are the same.
 
         """
-        return pow(2.0, self.entropy(text_ngrams))
+        return pow(
+            2.0, self.entropy(progress(text_ngrams, desc="Calculating Perplexity") if self.verbose else text_ngrams)
+        )
 
-    def generate(self, num_words=1, text_seed=None, random_seed=None):
-        """Generate words from the model.
+    def context_probabilities(self, context):
+        """Helper method for retrieving probabilities for a given context,
+        including all the words in the vocabulary
 
-        :param int num_words: How many words to generate. By default 1.
-        :param text_seed: Generation can be conditioned on preceding context.
-        :param random_seed: A random seed or an instance of `random.Random`. If provided,
-        makes the random sampling part of generation reproducible.
-        :return: One (str) word or a list of words generated from model.
-
-        Examples:
-
-        >>> from nltk.lm import MLE
-        >>> lm = MLE(2)
-        >>> lm.fit([[("a", "b"), ("b", "c")]], vocabulary_text=['a', 'b', 'c'])
-        >>> lm.fit([[("a",), ("b",), ("c",)]])
-        >>> lm.generate(random_seed=3)
-        'a'
-        >>> lm.generate(text_seed=['a'])
-        'b'
+        Assumes context has been checked and oov words in it masked.
+        :type context: tuple(str) or None
 
         """
-        text_seed = [] if text_seed is None else list(text_seed)
+        if context not in self._cache.keys():
+            self._cache[context] = {
+                word: self.score(word, context) for word in self.vocab.counts.keys()
+            }
+        return self._cache[context]
+
+    def _generate_single_word(
+        self, sampler_func, text_seed, random_generator, sampler_kwargs
+    ):
+        context = tuple(
+            text_seed[-self.order + 1 :] if len(text_seed) >= self.order else text_seed
+        )
+        distribution = self.context_probabilities(context)
+        # Sorting distribution achieves two things:
+        # - reproducible randomness when sampling
+        # - turns Dictionary into Sequence which `sampler` expects
+        distribution = sorted(distribution.items(), key=lambda x: x[1], reverse=True)
+        return sampler_func(
+            distribution, random_generator=random_generator, **sampler_kwargs
+        )
+
+    def generate(
+        self,
+        sampler_func=greedy_decoding,
+        num_words=1,
+        text_seed=None,
+        random_seed=None,
+        sampler_kwargs={},
+        EOS=None,
+        verbose=None
+    ):
         random_generator = _random_generator(random_seed)
-        # This is the base recursion case.
-        if num_words == 1:
-            context = (
-                text_seed[-self.order + 1 :]
-                if len(text_seed) >= self.order
-                else text_seed
-            )
-            samples = self.context_counts(self.vocab.lookup(context))
-            while context and not samples:
-                context = context[1:] if len(context) > 1 else []
-                samples = self.context_counts(self.vocab.lookup(context))
-            # Sorting samples achieves two things:
-            # - reproducible randomness when sampling
-            # - turns Mapping into Sequence which `_weighted_choice` expects
-            samples = sorted(samples)
-            return _weighted_choice(
-                samples,
-                tuple(self.score(w, context) for w in samples),
-                random_generator,
-            )
+        verbose = self.verbose if verbose is None else verbose
+        text_seed = (
+            random_generator.sample(self.vocab.counts.keys(), 1)
+            if text_seed is None
+            else list(text_seed)
+        )
+        if EOS:
+            sampler_kwargs["EOS"] = EOS
         # We build up text one word at a time using the preceding context.
         generated = []
-        for _ in range(num_words):
-            generated.append(
-                self.generate(
-                    num_words=1,
-                    text_seed=text_seed + generated,
-                    random_seed=random_generator,
-                )
+        _iter = range(num_words)
+        for _ in (progress(_iter, desc="Generating words") if verbose else _iter):
+            token = self._generate_single_word(
+                sampler_func=sampler_func,
+                text_seed=text_seed + generated,
+                random_generator=random_generator,
+                sampler_kwargs=sampler_kwargs,
             )
+            generated.append(token)
+            if token == EOS:
+                break
         return generated
