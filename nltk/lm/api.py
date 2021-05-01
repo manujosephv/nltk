@@ -239,10 +239,10 @@ class LanguageModel(metaclass=ABCMeta):
 
     def generate(
         self,
-        sampler_func=greedy_decoding,
         num_words=1,
         text_seed=None,
         random_seed=None,
+        sampler_func=greedy_decoding,
         sampler_kwargs={},
         EOS=None,
         verbose=None
